@@ -14,6 +14,7 @@ import scala.collection.mutable.ArrayBuffer
 
 object AdverStat {
 
+
   def main(args: Array[String]): Unit = {
     val sparkConf = new SparkConf().setAppName("areaStat").setMaster("local[*]")
     val sparkSession = SparkSession.builder().config(sparkConf).enableHiveSupport().getOrCreate()
@@ -63,9 +64,174 @@ object AdverStat {
     //需求一：实时维护黑名单
     generateBlackList(adRealTimeFilterDStream)
 
+    // 需求二：各省各城市一天中的广告点击量（累积统计）
+    val key2ProvinceCityCountDStream = provinceCityClickStat(adRealTimeFilterDStream)
+
+    // 需求三：统计各省Top3热门广告
+    proveinceTope3Adver(sparkSession, key2ProvinceCityCountDStream)
+
+    // 需求四：最近一个小时广告点击量统计
+    getRecentHourClickCount(adRealTimeFilterDStream)
+
+
+
     streamingContext.start()
     streamingContext.awaitTermination()
   }
+
+  def getRecentHourClickCount(adRealTimeFilterDStream: DStream[String]) = {
+    val key2TimeMinuteDStream = adRealTimeFilterDStream.map{
+      case log =>
+        val logSplit = log.split(" ")
+        val timeStamp = logSplit(0).toLong
+        // yyyyMMddHHmm
+        val timeMinute = DateUtils.formatTimeMinute(new Date(timeStamp))
+        val adid = logSplit(4).toLong
+
+        val key = timeMinute + "_" + adid
+        (key,1L)
+    }
+    val key2WindowDStream = key2TimeMinuteDStream.reduceByKeyAndWindow((a:Long, b:Long)=>(a+b), Minutes(60), Minutes(1))
+
+    key2WindowDStream.foreachRDD{
+      rdd => rdd.foreachPartition{
+        // (key, count)
+        items=>
+          val trendArray = new ArrayBuffer[AdClickTrend]()
+          for((key, count) <- items){
+            val keySplit = key.split("_")
+            // yyyyMMddHHmm
+            val timeMinute = keySplit(0)
+            val date = timeMinute.substring(0, 8)
+            val hour = timeMinute.substring(8,10)
+            val minute = timeMinute.substring(10)
+            val adid  = keySplit(1).toLong
+
+            trendArray += AdClickTrend(date, hour, minute, adid, count)
+          }
+          AdClickTrendDAO.updateBatch(trendArray.toArray)
+      }
+    }
+
+  }
+
+
+  def proveinceTope3Adver(sparkSession: SparkSession,
+                          key2ProvinceCityCountDStream: DStream[(String, Long)]) = {
+    // key2ProvinceCityCountDStream: [RDD[(key, count)]]
+    // key: date_province_city_adid
+    // key2ProvinceCountDStream: [RDD[(newKey, count)]]
+    // newKey: date_province_adid
+    val key2ProvinceCountDStream = key2ProvinceCityCountDStream.map{
+      case (key, count) =>
+        val keySplit = key.split("_")
+        val date = keySplit(0)
+        val province = keySplit(1)
+        val adid = keySplit(3)
+
+        val newKey = date + "_" + province + "_" + adid
+        (newKey, count)
+    }
+
+    val key2ProvinceAggrCountDStream = key2ProvinceCountDStream.reduceByKey(_+_)
+
+    val top3DStream = key2ProvinceAggrCountDStream.transform{
+      rdd =>
+        // rdd:RDD[(key, count)]
+        // key: date_province_adid
+        val basicDateRDD = rdd.map{
+          case (key, count) =>
+            val keySplit = key.split("_")
+            val date = keySplit(0)
+            val province = keySplit(1)
+            val adid = keySplit(2).toLong
+
+            (date, province, adid, count)
+        }
+
+        import sparkSession.implicits._
+        basicDateRDD.toDF("date", "province", "adid", "count").createOrReplaceTempView("tmp_basic_info")
+
+        val sql = "select date, province, adid, count from(" +
+          "select date, province, adid, count, " +
+          "row_number() over(partition by date,province order by count desc) rank from tmp_basic_info) t " +
+          "where rank <= 3"
+
+        sparkSession.sql(sql).rdd
+    }
+
+    top3DStream.foreachRDD{
+      // rdd : RDD[row]
+      rdd =>
+        rdd.foreachPartition{
+          // items : row
+          items =>
+            val top3Array = new ArrayBuffer[AdProvinceTop3]()
+            for(item <- items){
+              val date = item.getAs[String]("date")
+              val province = item.getAs[String]("province")
+              val adid = item.getAs[Long]("adid")
+              val count = item.getAs[Long]("count")
+
+              top3Array += AdProvinceTop3(date, province, adid, count)
+            }
+            AdProvinceTop3DAO.updateBatch(top3Array.toArray)
+        }
+    }
+  }
+
+
+
+  def provinceCityClickStat(adRealTimeFilterDStream: DStream[String]) = {
+    // adRealTimeFilterDStream: DStream[RDD[String]]    String -> log : timestamp province city userid adid
+    // key2ProvinceCityDStream: DStream[RDD[key, 1L]]
+    val key2ProvinceCityDStream = adRealTimeFilterDStream.map{
+      case log =>
+        val logSplit = log.split(" ")
+        val timeStamp = logSplit(0).toLong
+        // dateKey : yy-mm-dd
+        val dateKey = DateUtils.formatDateKey(new Date(timeStamp))
+        val province = logSplit(1)
+        val city = logSplit(2)
+        val adid = logSplit(4)
+
+        val key = dateKey + "_" + province + "_" + city + "_" + adid
+        (key, 1L)
+    }
+
+    // key2StateDStream： 某一天一个省的一个城市中某一个广告的点击次数（累积）
+    val key2StateDStream = key2ProvinceCityDStream.updateStateByKey[Long]{
+      (values:Seq[Long], state:Option[Long]) =>
+        var newValue = 0L
+        if(state.isDefined)
+          newValue = state.get
+        for(value <- values){
+          newValue += value
+        }
+        Some(newValue)
+    }
+
+    key2StateDStream.foreachRDD{
+      rdd => rdd.foreachPartition{
+        items =>
+          val adStatArray = new ArrayBuffer[AdStat]()
+          // key: date province city adid
+          for((key, count) <- items){
+            val keySplit = key.split("_")
+            val date = keySplit(0)
+            val province = keySplit(1)
+            val city = keySplit(2)
+            val adid = keySplit(3).toLong
+
+            adStatArray += AdStat(date, province, city, adid, count)
+          }
+          AdStatDAO.updateBatch(adStatArray.toArray)
+      }
+    }
+
+    key2StateDStream
+  }
+
 
   //构建（key，1L）
   def generateBlackList(adRealTimeFilterDStream: DStream[String]) = {
